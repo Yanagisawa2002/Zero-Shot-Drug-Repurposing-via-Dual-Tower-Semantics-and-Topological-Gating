@@ -180,13 +180,13 @@ python scripts/eval_pair_fixed_ho.py ^
 python scripts/generate_readme_figures.py
 ```
 
-## Why This Repo Is Useful on a Resume
+## Engineering Scope
 
-This project is structured as a research engineering codebase rather than a small tutorial package. The strongest engineering contributions are:
-- graph-data cleaning and leakage prevention
+This repository is organized as a research engineering codebase rather than a general-purpose library. The main implementation scope includes:
+- graph-data cleaning and leakage audits
 - multimodal feature routing under OOD constraints
 - mechanism-aware evaluation beyond plain AUROC
-- large ablation orchestration with reproducibility-focused scripts and tests
+- experiment orchestration, ablations, and regression tests
 
 ## Citation
 
