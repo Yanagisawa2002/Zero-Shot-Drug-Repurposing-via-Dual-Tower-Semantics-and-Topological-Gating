@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+title: Zero-Shot Drug Repurposing via Dual-Tower Semantics and Topological Gating
+message: If you use this repository, please cite it using the metadata from this file.
+type: software
+repository-code: https://github.com/Yanagisawa2002/Zero-Shot-Drug-Repurposing-via-Dual-Tower-Semantics-and-Topological-Gating
+license: MIT
+version: 1.0.0
+date-released: 2026-03-30
+authors:
+  - name: Yanagisawa2002
