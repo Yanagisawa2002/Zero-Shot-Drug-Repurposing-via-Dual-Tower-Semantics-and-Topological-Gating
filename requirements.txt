@@ -10,3 +10,4 @@ openpyxl
 mygene
 pubchempy
 rdkit-pypi
+matplotlib
