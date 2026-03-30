@@ -1,0 +1,4 @@
+id,type,name,source
+drug::A,drug,Drug A,DrugBank
+gene::1,gene/protein,GENE1,NCBI
+disease::X,disease,Disease X,MONDO

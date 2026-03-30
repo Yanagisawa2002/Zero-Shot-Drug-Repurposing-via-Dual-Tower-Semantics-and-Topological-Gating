@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local temp and caches
+tmp_test_artifacts/
+feature_utils_*/
+pytest-cache-files-*/
+
+# Experiment outputs and frozen snapshots
+outputs/
+frozen_experiments/
+
+# Local models and datasets
+models/
+data/
+open target/
+
+# Large artifacts
+*.pt
+*.pth
+*.pkl
+*.ckpt
+*.bin
+*.sqlite
+*.db
+*.log
+
+# Local environment files
+.env
+.env.*
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Root data artifacts
+triple_level_pubmedbert_llm_cleaned.csv

@@ -1,0 +1,5 @@
+src_id,src_type,dst_id,dst_type,rel
+drug::DB1,drug,gene/protein::101,gene/protein,targets
+drug::DB1,drug,disease::1,disease,indication
+drug::DB1,drug,disease::1,disease,off-label use
+drug::DB1,drug,disease::1,disease,contraindication

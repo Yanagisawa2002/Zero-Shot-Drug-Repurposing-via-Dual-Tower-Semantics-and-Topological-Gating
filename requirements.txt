@@ -1,0 +1,12 @@
+torch
+torch-geometric
+transformers
+pandas
+numpy
+scikit-learn
+tqdm
+pytest
+openpyxl
+mygene
+pubchempy
+rdkit-pypi
