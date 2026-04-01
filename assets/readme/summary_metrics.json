@@ -1,32 +1,121 @@
-{
-  "variants": {
-    "baseline_pure_gnn": {"label": "Pure GNN", "color": "#4C78A8"},
-    "single_tower": {"label": "Single Tower", "color": "#72B7B2"},
-    "sota_dual_tower": {"label": "Dual Tower", "color": "#F58518"},
-    "ablation_no_gnn": {"label": "No-GNN", "color": "#E45756"},
-    "variant_path_loss": {"label": "Path Loss", "color": "#54A24B"}
+﻿{
+  "protocol": {
+    "label": "v2 split + dynamic masking + OT direct-edge clean",
+    "notes": [
+      "Random/cross_drug/cross_disease splits are regenerated from raw PrimeKG target edges.",
+      "Held-out direct clinical edges are removed from the GNN message-passing graph for valid, test, and ot.",
+      "Training uses split-aware negative pools and batch-level dynamic masking of current positive edges."
+    ]
   },
-  "splits": {
-    "random": {
-      "baseline_pure_gnn": {"pair_auroc": [0.9786, 0.0060], "ot_auroc": [0.8886, 0.0120], "ho_auprc": [0.3409, 0.0070]},
-      "single_tower": {"pair_auroc": [0.9860, 0.0030], "ot_auroc": [0.8739, 0.0080], "ho_auprc": [0.3755, 0.0032]},
-      "sota_dual_tower": {"pair_auroc": [0.9873, 0.0018], "ot_auroc": [0.8500, 0.0109], "ho_auprc": [0.3323, 0.0054]},
-      "ablation_no_gnn": {"pair_auroc": [0.9818, 0.0030], "ot_auroc": [0.8008, 0.0096], "ho_auprc": [0.3290, 0.0003]},
-      "variant_path_loss": {"pair_auroc": [0.9895, 0.0015], "ot_auroc": [0.8591, 0.0109], "ho_auprc": [0.3381, 0.0055]}
-    },
-    "cross_drug": {
-      "baseline_pure_gnn": {"pair_auroc": [0.8368, 0.0244], "ot_auroc": [0.8335, 0.0064], "ho_auprc": [0.2934, 0.0163]},
-      "single_tower": {"pair_auroc": [0.8436, 0.0125], "ot_auroc": [0.8256, 0.0080], "ho_auprc": [0.3223, 0.0060]},
-      "sota_dual_tower": {"pair_auroc": [0.8854, 0.0202], "ot_auroc": [0.8122, 0.0161], "ho_auprc": [0.3194, 0.0072]},
-      "ablation_no_gnn": {"pair_auroc": [0.8336, 0.0130], "ot_auroc": [0.7228, 0.0060], "ho_auprc": [0.3077, 0.0028]},
-      "variant_path_loss": {"pair_auroc": [0.8846, 0.0196], "ot_auroc": [0.8129, 0.0144], "ho_auprc": [0.3193, 0.0027]}
-    },
-    "cross_disease": {
-      "baseline_pure_gnn": {"pair_auroc": [0.6423, 0.0211], "ot_auroc": [0.7482, 0.0199], "ho_auprc": [0.2409, 0.0167]},
-      "single_tower": {"pair_auroc": [0.7613, 0.0523], "ot_auroc": [0.7355, 0.0304], "ho_auprc": [0.3236, 0.0165]},
-      "sota_dual_tower": {"pair_auroc": [0.8014, 0.0134], "ot_auroc": [0.6956, 0.0240], "ho_auprc": [0.3078, 0.0039]},
-      "ablation_no_gnn": {"pair_auroc": [0.8828, 0.0154], "ot_auroc": [0.7236, 0.0063], "ho_auprc": [0.3197, 0.0019]},
-      "variant_path_loss": {"pair_auroc": [0.8224, 0.0074], "ot_auroc": [0.7161, 0.0089], "ho_auprc": [0.3193, 0.0091]}
+  "full_multiseed": {
+    "splits": {
+      "random": {
+        "label": "Random",
+        "pair_auroc": [0.9790, 0.0046],
+        "ot_auroc": [0.9815, 0.0037],
+        "ho_auprc": [0.3284, 0.0042]
+      },
+      "cross_drug": {
+        "label": "Cross-Drug",
+        "pair_auroc": [0.8319, 0.0071],
+        "ot_auroc": [0.8217, 0.0072],
+        "ho_auprc": [0.3081, 0.0074]
+      },
+      "cross_disease": {
+        "label": "Cross-Disease",
+        "pair_auroc": [0.8789, 0.0078],
+        "ot_auroc": [0.8446, 0.0184],
+        "ho_auprc": [0.3274, 0.0093]
+      }
     }
+  },
+  "text_vs_full_seed42": {
+    "splits": {
+      "random": {
+        "label": "Random",
+        "text_only": {
+          "pair_auroc": 0.9764,
+          "ot_auroc": 0.9704,
+          "ho_auprc": 0.3236
+        },
+        "full": {
+          "pair_auroc": 0.9802,
+          "ot_auroc": 0.9807,
+          "ho_auprc": 0.3254
+        }
+      },
+      "cross_drug": {
+        "label": "Cross-Drug",
+        "text_only": {
+          "pair_auroc": 0.7855,
+          "ot_auroc": 0.7900,
+          "ho_auprc": 0.3098
+        },
+        "full": {
+          "pair_auroc": 0.8414,
+          "ot_auroc": 0.8121,
+          "ho_auprc": 0.3086
+        }
+      },
+      "cross_disease": {
+        "label": "Cross-Disease",
+        "text_only": {
+          "pair_auroc": 0.8282,
+          "ot_auroc": 0.8376,
+          "ho_auprc": 0.3149
+        },
+        "full": {
+          "pair_auroc": 0.8768,
+          "ot_auroc": 0.8237,
+          "ho_auprc": 0.3240
+        }
+      }
+    }
+  },
+  "cross_disease_ablation_seed42": {
+    "variants": {
+      "text_only": {
+        "label": "Text-only",
+        "color": "#72B7B2",
+        "pair_auroc": 0.8282,
+        "ot_auroc": 0.8376,
+        "ho_auprc": 0.3149
+      },
+      "wo_text_semantics": {
+        "label": "w/o Text",
+        "color": "#4C78A8",
+        "pair_auroc": 0.8648,
+        "ot_auroc": 0.8475,
+        "ho_auprc": 0.3110
+      },
+      "wo_micro_path": {
+        "label": "w/o Micro-Path",
+        "color": "#F58518",
+        "pair_auroc": 0.8791,
+        "ot_auroc": 0.8534,
+        "ho_auprc": 0.3215
+      },
+      "full": {
+        "label": "Full",
+        "color": "#54A24B",
+        "pair_auroc": 0.8768,
+        "ot_auroc": 0.8237,
+        "ho_auprc": 0.3240
+      },
+      "wo_gated_fusion": {
+        "label": "w/o Gated Fusion",
+        "color": "#E45756",
+        "pair_auroc": 0.8989,
+        "ot_auroc": 0.8870,
+        "ho_auprc": 0.3204
+      }
+    },
+    "order": [
+      "text_only",
+      "wo_text_semantics",
+      "wo_micro_path",
+      "full",
+      "wo_gated_fusion"
+    ]
   }
 }
