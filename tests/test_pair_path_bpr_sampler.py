@@ -255,3 +255,67 @@ def test_quad_collate_fn_still_supports_disconnected_random_negative() -> None:
     assert batch['neg_paths'].shape == (1, 1, 4)
     assert torch.equal(batch['neg_paths'][0, 0], torch.zeros(4, dtype=torch.long))
     assert batch['neg_attention_mask'][0, 0].item() is False
+
+
+def test_random_negative_can_be_restricted_to_explicit_disease_pool() -> None:
+    torch.manual_seed(0)
+
+    data = _build_toy_data()
+    dataset = PairPathBPRDataset(
+        data=data,
+        negative_strategy='random',
+        negative_disease_pool=[30, 31],
+    )
+
+    for _ in range(10):
+        sample = dataset[0]
+        neg_pair = tuple(int(x) for x in sample['neg_pair_ids'].tolist())
+        assert neg_pair[1] in {30, 31}
+
+
+def test_cross_disease_negative_falls_back_to_restricted_disease_pool() -> None:
+    torch.manual_seed(0)
+
+    data = _build_toy_data()
+    dataset = PairPathBPRDataset(
+        data=data,
+        negative_strategy='cross_disease',
+        negative_disease_pool=[31],
+    )
+
+    sample = dataset[0]
+    neg_pair = tuple(int(x) for x in sample['neg_pair_ids'].tolist())
+
+    assert neg_pair == (10, 31)
+
+
+def test_random_negative_can_be_restricted_to_explicit_drug_pool() -> None:
+    torch.manual_seed(0)
+
+    data = _build_toy_data()
+    dataset = PairPathBPRDataset(
+        data=data,
+        negative_strategy='random',
+        negative_drug_pool=[10, 11],
+    )
+
+    for _ in range(10):
+        sample = dataset[0]
+        neg_pair = tuple(int(x) for x in sample['neg_pair_ids'].tolist())
+        assert neg_pair[0] in {10, 11}
+
+
+def test_cross_drug_negative_falls_back_to_restricted_drug_pool() -> None:
+    torch.manual_seed(0)
+
+    data = _build_toy_data()
+    dataset = PairPathBPRDataset(
+        data=data,
+        negative_strategy='cross_drug',
+        negative_drug_pool=[11],
+    )
+
+    sample = dataset[0]
+    neg_pair = tuple(int(x) for x in sample['neg_pair_ids'].tolist())
+
+    assert neg_pair == (11, 30)

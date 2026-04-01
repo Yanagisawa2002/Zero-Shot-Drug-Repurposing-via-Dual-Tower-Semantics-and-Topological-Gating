@@ -121,7 +121,9 @@ def derive_ho_triplets_for_pair_splits(
             elif src_type == 'disease' and dst_type == 'gene/protein' and relation == 'disease_protein':
                 gene_to_diseases[dst_gid].append(src_gid)
 
-    split_triplets: Dict[str, List[IdTriplet]] = {'train': [], 'valid': [], 'test': []}
+    split_triplets: Dict[str, List[IdTriplet]] = {
+        split_name: [] for split_name in pair_splits.keys()
+    }
     for gene_gid, drug_ids in gene_to_drugs.items():
         disease_ids = gene_to_diseases.get(gene_gid)
         if not disease_ids:

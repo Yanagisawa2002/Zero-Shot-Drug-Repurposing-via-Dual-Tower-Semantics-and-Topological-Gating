@@ -41,6 +41,8 @@ class PairPathBPRDataset(Dataset[SampleDict]):
         pathway_node_type: str = 'pathway',
         pathway_dummy_global_id: int = 0,
         pathway_edge_types: Optional[Sequence[EdgeType]] = None,
+        negative_drug_pool: Optional[Sequence[int]] = None,
+        negative_disease_pool: Optional[Sequence[int]] = None,
     ) -> None:
         super().__init__()
 
@@ -103,6 +105,16 @@ class PairPathBPRDataset(Dataset[SampleDict]):
         self.disease_ids: List[int] = [
             int(x) for x in data[self.disease_node_type].global_id.detach().cpu().tolist()
         ]
+        self.restrict_negative_drug_pool = negative_drug_pool is not None
+        self.negative_drug_ids: Tuple[int, ...] = self._build_negative_drug_pool(
+            negative_drug_pool=negative_drug_pool,
+        )
+        self.negative_drug_id_set: Set[int] = set(self.negative_drug_ids)
+        self.restrict_negative_disease_pool = negative_disease_pool is not None
+        self.negative_disease_ids: Tuple[int, ...] = self._build_negative_disease_pool(
+            negative_disease_pool=negative_disease_pool,
+        )
+        self.negative_disease_id_set: Set[int] = set(self.negative_disease_ids)
         self.gene_to_pathways: Dict[int, Tuple[int, ...]] = self._build_gene_to_pathways()
 
         self.positive_pair_to_paths = self._build_positive_pair_to_paths(self.ho_pos_paths)
@@ -207,6 +219,7 @@ class PairPathBPRDataset(Dataset[SampleDict]):
         fallback_positive_pairs: Set[Pair],
     ) -> Set[Pair]:
         pair_set: Set[Pair] = set(fallback_positive_pairs)
+        pair_set.update(self._build_direct_positive_pair_set_from_graph())
         if known_positive_pairs is None:
             return pair_set
 
@@ -230,6 +243,69 @@ class PairPathBPRDataset(Dataset[SampleDict]):
                 pair_set.add((int(item[0]), int(item[-1])))
             else:
                 raise ValueError('`known_positive_pairs` ????????? 2?3 ? 4?')
+        return pair_set
+
+    def _build_negative_disease_pool(
+        self,
+        negative_disease_pool: Optional[Sequence[int]],
+    ) -> Tuple[int, ...]:
+        if negative_disease_pool is None:
+            return tuple(self.disease_ids)
+
+        allowed_disease_ids = tuple(dict.fromkeys(int(x) for x in negative_disease_pool))
+        unknown_disease_ids = sorted(set(allowed_disease_ids).difference(self.disease_ids))
+        if unknown_disease_ids:
+            raise ValueError(
+                'All `negative_disease_pool` ids must belong to the disease node type; '
+                f'unknown ids: {unknown_disease_ids[:10]}'
+            )
+        if not allowed_disease_ids:
+            raise ValueError('`negative_disease_pool` must not be empty when provided.')
+        return allowed_disease_ids
+
+    def _build_negative_drug_pool(
+        self,
+        negative_drug_pool: Optional[Sequence[int]],
+    ) -> Tuple[int, ...]:
+        if negative_drug_pool is None:
+            return tuple(self.drug_ids)
+
+        allowed_drug_ids = tuple(dict.fromkeys(int(x) for x in negative_drug_pool))
+        unknown_drug_ids = sorted(set(allowed_drug_ids).difference(self.drug_ids))
+        if unknown_drug_ids:
+            raise ValueError(
+                'All `negative_drug_pool` ids must belong to the drug node type; '
+                f'unknown ids: {unknown_drug_ids[:10]}'
+            )
+        if not allowed_drug_ids:
+            raise ValueError('`negative_drug_pool` must not be empty when provided.')
+        return allowed_drug_ids
+
+    def _build_direct_positive_pair_set_from_graph(self) -> Set[Pair]:
+        direct_relations = {'indication', 'contraindication', 'off-label use'}
+        pair_set: Set[Pair] = set()
+
+        for edge_type, edge_index in self.data.edge_index_dict.items():
+            src_type, relation, dst_type = edge_type
+            normalized_relation = relation
+            if normalized_relation.startswith('rev_'):
+                normalized_relation = normalized_relation[4:]
+            if normalized_relation.endswith('__reverse__'):
+                normalized_relation = normalized_relation[:-11]
+            if normalized_relation.endswith('_reverse'):
+                normalized_relation = normalized_relation[:-8]
+            if normalized_relation not in direct_relations:
+                continue
+
+            if src_type == self.drug_node_type and dst_type == self.disease_node_type:
+                src_global_ids = self.data[src_type].global_id.detach().cpu()[edge_index[0].detach().cpu()]
+                dst_global_ids = self.data[dst_type].global_id.detach().cpu()[edge_index[1].detach().cpu()]
+                pair_set.update((int(drug_id), int(disease_id)) for drug_id, disease_id in zip(src_global_ids.tolist(), dst_global_ids.tolist()))
+            elif src_type == self.disease_node_type and dst_type == self.drug_node_type:
+                src_global_ids = self.data[src_type].global_id.detach().cpu()[edge_index[0].detach().cpu()]
+                dst_global_ids = self.data[dst_type].global_id.detach().cpu()[edge_index[1].detach().cpu()]
+                pair_set.update((int(drug_id), int(disease_id)) for disease_id, drug_id in zip(src_global_ids.tolist(), dst_global_ids.tolist()))
+
         return pair_set
 
     def _build_path_bank(
@@ -463,44 +539,50 @@ class PairPathBPRDataset(Dataset[SampleDict]):
         pos_drug_id, pos_disease_id = pos_pair
 
         if strategy == 'random':
-            connected_candidate = self._try_sample_topology_random_negative(pos_pair=pos_pair)
-            if connected_candidate is not None:
-                return connected_candidate
+            if not self.restrict_negative_disease_pool and not self.restrict_negative_drug_pool:
+                connected_candidate = self._try_sample_topology_random_negative(pos_pair=pos_pair)
+                if connected_candidate is not None:
+                    return connected_candidate
 
-            for _ in range(self.max_sampling_attempts):
-                candidate = (
-                    self.drug_ids[torch.randint(low=0, high=len(self.drug_ids), size=(1,)).item()],
-                    self.disease_ids[
-                        torch.randint(low=0, high=len(self.disease_ids), size=(1,)).item()
-                    ],
-                )
-                if candidate != pos_pair and candidate not in self.known_positive_pair_set:
-                    return candidate
-
-            for drug_id in self.drug_ids:
-                for disease_id in self.disease_ids:
-                    candidate = (drug_id, disease_id)
-                    if candidate != pos_pair and candidate not in self.known_positive_pair_set:
-                        return candidate
-            return None
+            return self._sample_random_negative_from_disease_pool(pos_pair=pos_pair)
 
         if strategy == 'cross_drug':
             candidate_drug_ids = self.disease_to_connected_drugs.get(pos_disease_id, ())
-            return self._sample_connected_cross_pair(
+            if self.restrict_negative_drug_pool:
+                candidate_drug_ids = tuple(
+                    drug_id for drug_id in candidate_drug_ids
+                    if int(drug_id) in self.negative_drug_id_set
+                )
+            candidate = self._sample_connected_cross_pair(
                 variable_candidates=candidate_drug_ids,
                 fixed_id=pos_disease_id,
                 pos_pair=pos_pair,
                 mode='cross_drug',
             )
+            if candidate is not None:
+                return candidate
+            if self.restrict_negative_drug_pool:
+                return self._sample_cross_drug_from_pool(pos_pair=pos_pair)
+            return None
 
         if strategy == 'cross_disease':
             candidate_disease_ids = self.drug_to_connected_diseases.get(pos_drug_id, ())
-            return self._sample_connected_cross_pair(
+            if self.restrict_negative_disease_pool:
+                candidate_disease_ids = tuple(
+                    disease_id for disease_id in candidate_disease_ids
+                    if int(disease_id) in self.negative_disease_id_set
+                )
+            candidate = self._sample_connected_cross_pair(
                 variable_candidates=candidate_disease_ids,
                 fixed_id=pos_drug_id,
                 pos_pair=pos_pair,
                 mode='cross_disease',
             )
+            if candidate is not None:
+                return candidate
+            if self.restrict_negative_disease_pool:
+                return self._sample_cross_disease_from_pool(pos_pair=pos_pair)
+            return None
 
         raise ValueError(f'???? negative strategy: {strategy}')
 
@@ -516,6 +598,58 @@ class PairPathBPRDataset(Dataset[SampleDict]):
                 return candidate
 
         for candidate in self.connected_pairs:
+            if candidate != pos_pair and candidate not in self.known_positive_pair_set:
+                return candidate
+        return None
+
+    def _sample_random_negative_from_disease_pool(self, pos_pair: Pair) -> Optional[Pair]:
+        for _ in range(self.max_sampling_attempts):
+            candidate = (
+                self.negative_drug_ids[
+                    torch.randint(low=0, high=len(self.negative_drug_ids), size=(1,)).item()
+                ],
+                self.negative_disease_ids[
+                    torch.randint(low=0, high=len(self.negative_disease_ids), size=(1,)).item()
+                ],
+            )
+            if candidate != pos_pair and candidate not in self.known_positive_pair_set:
+                return candidate
+
+        for drug_id in self.negative_drug_ids:
+            for disease_id in self.negative_disease_ids:
+                candidate = (int(drug_id), int(disease_id))
+                if candidate != pos_pair and candidate not in self.known_positive_pair_set:
+                    return candidate
+        return None
+
+    def _sample_cross_drug_from_pool(self, pos_pair: Pair) -> Optional[Pair]:
+        _, pos_disease_id = pos_pair
+        for _ in range(self.max_sampling_attempts):
+            drug_id = self.negative_drug_ids[
+                torch.randint(low=0, high=len(self.negative_drug_ids), size=(1,)).item()
+            ]
+            candidate = (int(drug_id), int(pos_disease_id))
+            if candidate != pos_pair and candidate not in self.known_positive_pair_set:
+                return candidate
+
+        for drug_id in self.negative_drug_ids:
+            candidate = (int(drug_id), int(pos_disease_id))
+            if candidate != pos_pair and candidate not in self.known_positive_pair_set:
+                return candidate
+        return None
+
+    def _sample_cross_disease_from_pool(self, pos_pair: Pair) -> Optional[Pair]:
+        pos_drug_id, _ = pos_pair
+        for _ in range(self.max_sampling_attempts):
+            disease_id = self.negative_disease_ids[
+                torch.randint(low=0, high=len(self.negative_disease_ids), size=(1,)).item()
+            ]
+            candidate = (int(pos_drug_id), int(disease_id))
+            if candidate != pos_pair and candidate not in self.known_positive_pair_set:
+                return candidate
+
+        for disease_id in self.negative_disease_ids:
+            candidate = (int(pos_drug_id), int(disease_id))
             if candidate != pos_pair and candidate not in self.known_positive_pair_set:
                 return candidate
         return None
@@ -593,6 +727,8 @@ def build_pair_path_bpr_dataloader(
     pathway_node_type: str = 'pathway',
     pathway_dummy_global_id: int = 0,
     pathway_edge_types: Optional[Sequence[EdgeType]] = None,
+    negative_drug_pool: Optional[Sequence[int]] = None,
+    negative_disease_pool: Optional[Sequence[int]] = None,
 ) -> DataLoader[BatchDict]:
     dataset = PairPathBPRDataset(
         data=data,
@@ -606,6 +742,8 @@ def build_pair_path_bpr_dataloader(
         pathway_node_type=pathway_node_type,
         pathway_dummy_global_id=pathway_dummy_global_id,
         pathway_edge_types=pathway_edge_types,
+        negative_drug_pool=negative_drug_pool,
+        negative_disease_pool=negative_disease_pool,
     )
 
     return DataLoader(

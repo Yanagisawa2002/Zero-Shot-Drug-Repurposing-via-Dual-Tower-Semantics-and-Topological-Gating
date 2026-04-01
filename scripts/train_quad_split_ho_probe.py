@@ -60,6 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--pretrained-encoder-path', type=Path, default=None)
     parser.add_argument('--ot-novel-csv', type=Path, default=Path('outputs/ot_random_external_profile/novel_ood_triplets.csv'))
     parser.add_argument('--epochs', type=int, default=60)
+    parser.add_argument('--eval-every', type=int, default=10)
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--hidden-channels', type=int, default=128)
     parser.add_argument('--out-dim', type=int, default=128)
@@ -73,13 +74,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--max-ho-sampling-attempts', type=int, default=256)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--ablate-gnn', action='store_true')
+    parser.add_argument('--disable-gated-fusion', action='store_true')
+    parser.add_argument('--disable-text-semantics', action='store_true')
     parser.add_argument('--path-loss-weight', type=float, default=0.1)
+    parser.add_argument('--path-loss-start-epoch', type=int, default=30)
     parser.add_argument(
         '--graph-surgery-mode',
         type=str,
         default='strict',
         choices=['strict', 'direct_only'],
-        help='strict: old full mechanism-removal surgery; direct_only: remove only held-out drug-disease shortcut edges.',
+        help='strict/direct_only: targeted pair-level clean that removes only held-out drug-disease prediction edges while preserving auxiliary mechanism edges.',
     )
     return parser.parse_args()
 
@@ -120,25 +124,42 @@ def build_clean_graph_without_leakage(
     pair_splits: Dict[str, set[Tuple[int, int]]],
     graph_surgery_mode: str,
 ):
-    if graph_surgery_mode == 'direct_only':
-        holdout_pairs = collect_holdout_pairs_from_pair_splits(pair_splits=pair_splits)
-        clean_data = remove_direct_leakage_edges(
-            data=data,
-            holdout_pairs=holdout_pairs,
+    holdout_pairs = collect_holdout_pairs_from_pair_splits(
+        pair_splits=pair_splits,
+        split_names=tuple(
+            split_name for split_name in ('valid', 'test', 'ot')
+            if split_name in pair_splits
+        ),
+    )
+    if heldout_triplets:
+        heldout_triplet_pairs = torch.tensor(
+            sorted({(int(path[0]), int(path[-1])) for path in heldout_triplets}),
+            dtype=torch.long,
         )
-    elif graph_surgery_mode == 'strict':
-        heldout_tensor = torch.tensor(heldout_triplets, dtype=torch.long)
-        isolate_nodes_by_type = build_split_isolation_targets(split_mode=split_mode, pair_splits=pair_splits)
-        clean_edge_index_dict = remove_leakage_edges(
-            data=data,
-            target_paths=heldout_tensor,
-            isolate_nodes_by_type=isolate_nodes_by_type,
-        )
-        clean_data = copy.deepcopy(data)
-        for edge_type, clean_edge_index in clean_edge_index_dict.items():
-            clean_data[edge_type].edge_index = clean_edge_index
-    else:
+        if holdout_pairs.numel() == 0:
+            holdout_pairs = heldout_triplet_pairs
+        else:
+            holdout_pairs = torch.unique(
+                torch.cat([holdout_pairs, heldout_triplet_pairs], dim=0),
+                dim=0,
+            )
+
+    if graph_surgery_mode not in {'direct_only', 'strict'}:
         raise ValueError(f'Unsupported graph_surgery_mode: {graph_surgery_mode}')
+
+    # NOTE:
+    # The legacy `strict` path used `remove_leakage_edges(..., isolate_nodes_by_type=...)`,
+    # which removed every incident edge for held-out drugs/diseases under cross_drug /
+    # cross_disease. That made internal valid/test nodes nearly degree-0 while OT nodes
+    # still kept their auxiliary mechanism edges, creating an asymmetric benchmark.
+    #
+    # The current benchmark uses targeted pair-level clean for both `direct_only` and
+    # `strict`: remove only held-out drug-disease prediction edges, while preserving
+    # drug-target, disease-gene, pathway, phenotype, and other auxiliary edges.
+    clean_data = remove_direct_leakage_edges(
+        data=data,
+        holdout_pairs=holdout_pairs,
+    )
 
     total_removed_edges = 0
     leakage_edge_summary: Dict[str, Dict[str, int]] = {}
@@ -163,6 +184,27 @@ def select_primary_setting(split_mode: str) -> str:
     return split_mode
 
 
+def build_train_negative_sampling_pools(
+    split_mode: str,
+    pair_splits: Dict[str, set[Tuple[int, int]]],
+) -> Dict[str, List[int] | None]:
+    train_pairs = pair_splits['train']
+    train_drug_ids = sorted({int(drug_id) for drug_id, _ in train_pairs})
+    train_disease_ids = sorted({int(disease_id) for _, disease_id in train_pairs})
+
+    negative_drug_pool = None
+    negative_disease_pool = None
+    if split_mode == 'cross_drug':
+        negative_drug_pool = train_drug_ids
+    elif split_mode == 'cross_disease':
+        negative_disease_pool = train_disease_ids
+
+    return {
+        'negative_drug_pool': negative_drug_pool,
+        'negative_disease_pool': negative_disease_pool,
+    }
+
+
 def save_checkpoint(
     checkpoint_path: Path,
     model: RepurposingRGCN,
@@ -177,6 +219,7 @@ def save_checkpoint(
     effective_disease_text_embeddings_path: Path | None,
     effective_text_distill_alpha: float,
     path_loss_weight: float,
+    path_loss_start_epoch: int,
 ) -> None:
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -198,6 +241,7 @@ def save_checkpoint(
             'disease_text_embeddings_path': None if effective_disease_text_embeddings_path is None else str(effective_disease_text_embeddings_path),
             'text_distill_alpha': float(effective_text_distill_alpha),
             'path_loss_weight': float(path_loss_weight),
+            'path_loss_start_epoch': int(path_loss_start_epoch),
             'primary_loss_type': str(args.primary_loss_type),
             'initial_residual_alpha': float(args.initial_residual_alpha),
             'use_early_external_fusion': bool(args.use_early_external_fusion),
@@ -205,6 +249,8 @@ def save_checkpoint(
             'ablate_gnn': bool(args.ablate_gnn),
             'pretrained_encoder_path': None if args.pretrained_encoder_path is None else str(args.pretrained_encoder_path),
             'dropedge_p': float(args.dropedge_p),
+            'disable_gated_fusion': bool(args.disable_gated_fusion),
+            'disable_text_semantics': bool(args.disable_text_semantics),
         },
         'model_state_dict': {k: v.detach().cpu() for k, v in model.state_dict().items()},
         'valid_eval': valid_eval,
@@ -276,7 +322,14 @@ def main() -> None:
         edge_csv_path=args.edges_csv,
         pair_splits=pair_splits,
     )
-    ot_triplets = load_ot_triplets(args.ot_novel_csv, processor.global_entity2id)
+    ot_triplets_from_split = list(split_triplets.get('ot', []))
+    if ot_triplets_from_split:
+        ot_triplets = ot_triplets_from_split
+        ot_source = 'processed_ot_split'
+    else:
+        ot_triplets = load_ot_triplets(args.ot_novel_csv, processor.global_entity2id)
+        ot_source = 'external_ot_csv'
+    print('ot_source:', ot_source)
 
     full_data = processor.build_heterodata(ho_id_paths=split_triplets['train'], add_inverse_edges=False)
     inject_features_to_graph(data=full_data, feature_dir=args.feature_dir)
@@ -290,6 +343,15 @@ def main() -> None:
         graph_surgery_mode=args.graph_surgery_mode,
     )
 
+    train_negative_sampling_pools = build_train_negative_sampling_pools(
+        split_mode=split_mode,
+        pair_splits=pair_splits,
+    )
+    print(
+        'train_negative_sampling_pools:',
+        f"negative_drug_pool_size={0 if train_negative_sampling_pools['negative_drug_pool'] is None else len(train_negative_sampling_pools['negative_drug_pool'])}",
+        f"negative_disease_pool_size={0 if train_negative_sampling_pools['negative_disease_pool'] is None else len(train_negative_sampling_pools['negative_disease_pool'])}",
+    )
     train_loader = build_pair_path_bpr_dataloader(
         data=clean_data,
         batch_size=args.batch_size,
@@ -297,6 +359,8 @@ def main() -> None:
         num_workers=0,
         negative_strategy='mixed',
         use_pathway_quads=True,
+        negative_drug_pool=train_negative_sampling_pools['negative_drug_pool'],
+        negative_disease_pool=train_negative_sampling_pools['negative_disease_pool'],
     )
 
     effective_text_distill_alpha = (
@@ -329,6 +393,8 @@ def main() -> None:
         use_early_external_fusion=args.use_early_external_fusion,
         dropedge_p=args.dropedge_p,
         ablate_gnn=args.ablate_gnn,
+        disable_gated_fusion=args.disable_gated_fusion,
+        disable_text_semantics=args.disable_text_semantics,
     ).to(device)
     pretrained_load_summary: Dict[str, object] | None = None
     if args.pretrained_encoder_path is not None:
@@ -345,7 +411,11 @@ def main() -> None:
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     primary_setting = select_primary_setting(split_mode)
-    eval_epochs = {1, 10, 20, 30, 40, 50, 60}
+    if args.eval_every <= 0:
+        raise ValueError('--eval-every must be positive.')
+    eval_epochs = set(range(args.eval_every, args.epochs + 1, args.eval_every))
+    eval_epochs.add(1)
+    eval_epochs.add(args.epochs)
     best_valid_auroc = float('-inf')
     best_epoch = -1
     best_valid_eval: Dict[str, Dict[str, float]] | None = None
@@ -357,28 +427,43 @@ def main() -> None:
     test_tensor = torch.tensor(split_triplets['test'], dtype=torch.long)
 
     for epoch in range(1, args.epochs + 1):
+        path_loss_active = bool(float(args.path_loss_weight) > 0.0 and epoch >= int(args.path_loss_start_epoch))
+        effective_path_loss_weight = float(args.path_loss_weight) if path_loss_active else 0.0
         train_metrics = train_epoch(
             model=model,
             full_graph_data=clean_data,
             bpr_dataloader=train_loader,
             optimizer=optimizer,
             primary_loss_type=args.primary_loss_type,
-            path_loss_weight=args.path_loss_weight,
+            path_loss_weight=effective_path_loss_weight,
         )
-        record: Dict[str, object] = {'epoch': epoch, 'train': train_metrics}
+        record: Dict[str, object] = {
+            'epoch': epoch,
+            'train': train_metrics,
+            'path_loss_active': path_loss_active,
+            'effective_path_loss_weight': effective_path_loss_weight,
+        }
 
         if epoch in eval_epochs:
+            print(f"--- [PROBE] Starting VALID evaluation | split={split_mode} | paths={int(valid_tensor.size(0))} ---")
             valid_eval = evaluate_model_quad(
                 model=model,
                 data=clean_data,
                 valid_ho_paths=valid_tensor,
                 batch_size=args.batch_size,
+                restrict_negative_disease_pool=True,
+                entity_lookup=processor.id2entity,
+                probe_name='VALID',
             )
+            print(f"--- [PROBE] Starting TEST evaluation | split={split_mode} | paths={int(test_tensor.size(0))} ---")
             test_eval = evaluate_model_quad(
                 model=model,
                 data=clean_data,
                 valid_ho_paths=test_tensor,
                 batch_size=args.batch_size,
+                restrict_negative_disease_pool=True,
+                entity_lookup=processor.id2entity,
+                probe_name='TEST',
             )
             record['valid_eval'] = valid_eval
             record['test_eval'] = test_eval
@@ -386,6 +471,8 @@ def main() -> None:
             target_valid_auroc = float(valid_eval[primary_setting]['auroc'])
             print(
                 f"epoch={epoch:02d} "
+                f"path_loss_active={'on' if path_loss_active else 'off'} "
+                f"path_loss_weight={effective_path_loss_weight:.3f} "
                 f"train_pair_loss={train_metrics['pair_loss']:.4f} "
                 f"train_path_loss={train_metrics.get('path_loss', 0.0):.4f} "
                 f"valid_{primary_setting}_auc={target_valid_auroc:.4f} "
@@ -413,6 +500,7 @@ def main() -> None:
                     effective_disease_text_embeddings_path=effective_disease_text_embeddings_path,
                     effective_text_distill_alpha=effective_text_distill_alpha,
                     path_loss_weight=float(args.path_loss_weight),
+                    path_loss_start_epoch=int(args.path_loss_start_epoch),
                 )
         history.append(record)
 
@@ -434,11 +522,18 @@ def main() -> None:
         seed=args.seed,
     )
     ot_tensor = torch.tensor(ot_triplets, dtype=torch.long)
+    if ot_tensor.numel() > 0:
+        print(f"--- [PROBE] Starting OT evaluation | split={split_mode} | paths={int(ot_tensor.size(0))} ---")
+    pair_reference_tensor = torch.cat([valid_tensor, test_tensor], dim=0)
     ot_eval = evaluate_model_quad(
         model=model,
         data=clean_data,
         valid_ho_paths=ot_tensor,
         batch_size=args.batch_size,
+        restrict_negative_disease_pool=True,
+        entity_lookup=processor.id2entity,
+        probe_name='OT',
+        comparison_pair_paths=pair_reference_tensor,
     ) if ot_tensor.numel() > 0 else None
 
     payload = {
@@ -447,7 +542,9 @@ def main() -> None:
             'checkpoint_path': str(args.checkpoint_path),
             'feature_dir': str(args.feature_dir),
             'ot_novel_csv': str(args.ot_novel_csv),
+            'ot_source': ot_source,
             'epochs': args.epochs,
+            'eval_every': int(args.eval_every),
             'batch_size': args.batch_size,
             'hidden_channels': args.hidden_channels,
             'out_dim': args.out_dim,
@@ -466,12 +563,15 @@ def main() -> None:
             'disease_text_embeddings_path': None if effective_disease_text_embeddings_path is None else str(effective_disease_text_embeddings_path),
             'text_distill_alpha': float(effective_text_distill_alpha),
             'path_loss_weight': float(args.path_loss_weight),
+            'path_loss_start_epoch': int(args.path_loss_start_epoch),
             'primary_loss_type': str(args.primary_loss_type),
             'disable_triplet_distill': bool(args.disable_triplet_distill),
             'disable_morgan': bool(args.disable_morgan),
             'disable_disease_semantic': bool(args.disable_disease_semantic),
             'pretrained_encoder_path': None if args.pretrained_encoder_path is None else str(args.pretrained_encoder_path),
             'dropedge_p': float(args.dropedge_p),
+            'disable_gated_fusion': bool(args.disable_gated_fusion),
+            'disable_text_semantics': bool(args.disable_text_semantics),
         },
         'triplet_summary': {
             split_name: {
@@ -518,3 +618,4 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+

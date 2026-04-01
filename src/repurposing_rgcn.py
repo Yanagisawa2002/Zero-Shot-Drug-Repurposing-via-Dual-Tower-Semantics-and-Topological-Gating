@@ -62,6 +62,8 @@ class RepurposingRGCN(nn.Module):
         use_early_external_fusion: bool = False,
         dropedge_p: float = 0.15,
         ablate_gnn: bool = False,
+        disable_gated_fusion: bool = False,
+        disable_text_semantics: bool = False,
     ) -> None:
         super().__init__()
 
@@ -103,6 +105,8 @@ class RepurposingRGCN(nn.Module):
         self.use_early_external_fusion = bool(use_early_external_fusion)
         self.dropedge_p = float(dropedge_p)
         self.ablate_gnn = bool(ablate_gnn)
+        self.disable_gated_fusion = bool(disable_gated_fusion)
+        self.disable_text_semantics = bool(disable_text_semantics)
         self.drug_fingerprint_dim = 1024
         self.disease_text_dim = 768
         self.triplet_text_embeddings_path = (
@@ -148,6 +152,8 @@ class RepurposingRGCN(nn.Module):
                 for node_type in self.node_types
             }
         )
+        for embedding in self.node_embeddings.values():
+            embedding.weight.requires_grad = False
         self.feature_projections = nn.ModuleDict(
             {
                 node_type: nn.Linear(self.in_channels, self.hidden_channels)
@@ -216,6 +222,16 @@ class RepurposingRGCN(nn.Module):
             int(data[node_type].global_id.max().item())
             for node_type in self.node_types
         ) + 1
+        self._direct_edge_probe_hash_base = int(max_global_id)
+        self.register_buffer(
+            'direct_drug_disease_hashes',
+            self._build_direct_drug_disease_hashes(
+                data=data,
+                hash_base=self._direct_edge_probe_hash_base,
+            ),
+            persistent=False,
+        )
+        self._eval_path_probe_emitted = False
         self.register_buffer(
             'disease_external_feature_matrix',
             torch.empty((0, self.disease_text_dim), dtype=torch.float32),
@@ -244,6 +260,8 @@ class RepurposingRGCN(nn.Module):
             max_global_id=max_global_id,
             use_external_late_fusion=scorer_drug_morgan_path is not None,
             ablate_gnn=self.ablate_gnn,
+            disable_gated_fusion=self.disable_gated_fusion,
+            disable_text_semantics=self.disable_text_semantics,
         )
 
         self._global_to_local_buffer_names: Dict[str, str] = {}
@@ -256,6 +274,74 @@ class RepurposingRGCN(nn.Module):
     @staticmethod
     def _probability_to_logit(probability: float) -> float:
         return math.log(probability / (1.0 - probability))
+
+    @staticmethod
+    def _normalize_direct_relation_name(relation: str) -> str:
+        normalized = str(relation)
+        if normalized.startswith('rev_'):
+            normalized = normalized[4:]
+        if normalized.endswith('__reverse__'):
+            normalized = normalized[:-11]
+        if normalized.endswith('_reverse'):
+            normalized = normalized[:-8]
+        return normalized
+
+    def _build_direct_drug_disease_hashes(
+        self,
+        data: HeteroData,
+        hash_base: int,
+    ) -> Tensor:
+        direct_relations = {'indication', 'contraindication', 'off-label use'}
+        hash_chunks: List[Tensor] = []
+        for edge_type, edge_index in data.edge_index_dict.items():
+            src_type, relation, dst_type = edge_type
+            normalized_relation = self._normalize_direct_relation_name(relation)
+            if normalized_relation not in direct_relations:
+                continue
+            if src_type == self.drug_node_type and dst_type == self.disease_node_type:
+                drug_ids = edge_index[0].to(dtype=torch.long)
+                disease_ids = edge_index[1].to(dtype=torch.long)
+            elif src_type == self.disease_node_type and dst_type == self.drug_node_type:
+                drug_ids = edge_index[1].to(dtype=torch.long)
+                disease_ids = edge_index[0].to(dtype=torch.long)
+            else:
+                continue
+            hash_chunks.append(drug_ids * int(hash_base) + disease_ids)
+
+        if not hash_chunks:
+            return torch.empty(0, dtype=torch.long)
+        return torch.unique(torch.cat(hash_chunks, dim=0))
+
+    def _emit_eval_path_sampling_probe(
+        self,
+        pair_ids: Tensor,
+        paths: Tensor,
+        attention_mask: Tensor,
+    ) -> None:
+        if self.training or self._eval_path_probe_emitted:
+            return
+
+        self._eval_path_probe_emitted = True
+        valid_path_counts = attention_mask.to(dtype=torch.long).sum(dim=1)
+        batch_hashes = pair_ids[:, 0].to(dtype=torch.long) * int(self._direct_edge_probe_hash_base) + pair_ids[:, 1].to(dtype=torch.long)
+        direct_pair_hits = int(torch.isin(batch_hashes, self.direct_drug_disease_hashes).sum().item())
+
+        print('--- [PROBE] Test/OT phase path sampling sanity check triggered ---')
+        print(
+            f'--- [PROBE] pair_batch_size={pair_ids.size(0)} '
+            f'valid_path_min={int(valid_path_counts.min().item()) if valid_path_counts.numel() > 0 else 0} '
+            f'valid_path_max={int(valid_path_counts.max().item()) if valid_path_counts.numel() > 0 else 0} '
+            f'direct_pair_hits={direct_pair_hits} ---'
+        )
+        if pair_ids.size(0) > 0:
+            sample_pair = pair_ids[0].detach().cpu().tolist()
+            sample_valid_mask = attention_mask[0].detach().cpu()
+            sample_paths = paths[0][sample_valid_mask].detach().cpu().tolist()
+            print(
+                f'--- [PROBE] sample_pair={sample_pair} '
+                f'sample_valid_path_count={len(sample_paths)} '
+                f'sample_path_preview={sample_paths[:3]} ---'
+            )
 
     def reset_parameters(self) -> None:
         for embedding in self.node_embeddings.values():
@@ -346,7 +432,18 @@ class RepurposingRGCN(nn.Module):
             attention_mask=attention_mask,
         )
 
+        paths = self._apply_targeted_pathway_dropout(paths=paths)
         attention_mask = attention_mask.to(dtype=torch.bool)
+        paths, attention_mask = self._apply_eval_connectivity_equalization(
+            paths=paths,
+            attention_mask=attention_mask,
+        )
+        if not self.training:
+            self._emit_eval_path_sampling_probe(
+                pair_ids=pair_ids,
+                paths=paths,
+                attention_mask=attention_mask,
+            )
 
         pair_drug_embs = self._gather_node_embeddings_by_global_ids(
             node_embs_dict=node_embs_dict,
@@ -360,11 +457,12 @@ class RepurposingRGCN(nn.Module):
         )
         pair_embs = torch.stack([pair_drug_embs, pair_disease_embs], dim=1)
 
+        synthetic_dummy_path_mask = attention_mask & paths.eq(0).all(dim=2)
         path_component_embs: List[Tensor] = []
         for column_index, node_type in enumerate(self.path_node_types):
-            component_valid_mask = attention_mask
+            component_valid_mask = attention_mask & (~synthetic_dummy_path_mask)
             if self.use_pathway_quads and node_type == self.pathway_node_type:
-                component_valid_mask = attention_mask & (
+                component_valid_mask = component_valid_mask & (
                     paths[:, :, column_index] != self.pathway_dummy_global_id
                 )
 
@@ -613,6 +711,10 @@ class RepurposingRGCN(nn.Module):
                     )
                 prepared_dict[node_type] = self.feature_projections[node_type](raw_x)
             else:
+                # TODO: replace this fallback ID-only embedding path with semantic
+                # pretrained features for node types that still lack external `x`.
+                # Gene/protein nodes are the highest-priority target for future
+                # SapBERT-style feature injection here.
                 node_ids = torch.arange(
                     self.node_embeddings[node_type].num_embeddings,
                     device=self.node_embeddings[node_type].weight.device,
@@ -899,3 +1001,49 @@ class RepurposingRGCN(nn.Module):
             raise ValueError('`pair_ids`, `paths`, and `attention_mask` must share the same batch size.')
         if paths.size(1) != attention_mask.size(1):
             raise ValueError('`paths` and `attention_mask` must share the same max_K dimension.')
+
+
+    def _apply_targeted_pathway_dropout(
+        self,
+        paths: Tensor,
+    ) -> Tensor:
+        # ==========================================
+        # [ANTI-LEAKAGE]: Permanent Pathway Removal
+        # Force every pathway slot to the dummy id so the model cannot
+        # exploit pathway-annotation sparsity as a shortcut.
+        # ==========================================
+        if paths is None or paths.dim() != 3 or paths.size(-1) != 4:
+            return paths
+
+        safe_paths = paths.clone()
+        pathway_column = 2
+        safe_paths[:, :, pathway_column] = self.pathway_dummy_global_id
+        return safe_paths
+
+
+    def _apply_eval_connectivity_equalization(
+        self,
+        paths: Tensor,
+        attention_mask: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        # ==========================================
+        # [ANTI-LEAKAGE]: Connectivity Equalization (Evaluation Only)
+        # Equalize path existence and path-count signals so eval cannot
+        # exploit whether a pair has any path or how many paths it has.
+        # ==========================================
+        if self.training or paths is None or attention_mask is None:
+            return paths, attention_mask
+
+        safe_paths = paths.clone()
+        safe_attention_mask = attention_mask.to(dtype=torch.bool).clone()
+        if safe_paths.size(1) == 0:
+            return safe_paths, safe_attention_mask
+
+        empty_mask = ~safe_attention_mask.any(dim=1)
+        if bool(empty_mask.any()):
+            safe_paths[empty_mask, 0, :] = 0
+            safe_attention_mask[empty_mask, 0] = True
+
+        safe_paths = safe_paths[:, :1, :]
+        safe_attention_mask = safe_attention_mask[:, :1]
+        return safe_paths, safe_attention_mask

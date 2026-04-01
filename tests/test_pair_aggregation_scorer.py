@@ -320,13 +320,46 @@ def test_pair_aggregation_scorer_loads_symmetric_drug_and_disease_text_embedding
         enabled_attr='_disease_text_enabled',
     )
 
-    assert scorer.output_mlp[0].in_features == (8 + 2 * 4 + 1024 + 768 + 768)
+    assert scorer.output_mlp[0].in_features == (8 + 2 * 4 + 1024)
     assert scorer.drug_text_matrix.shape == (3, 768)
     assert scorer.disease_text_matrix.shape == (3, 768)
     assert torch.allclose(drug_text_hit, torch.full((1, 768), 3.0))
     assert torch.allclose(disease_text_hit, torch.full((1, 768), 2.0))
     assert torch.allclose(disease_text_miss, torch.zeros_like(disease_text_miss))
 
+    pair_embs = torch.randn(2, 2, 4)
+    paths_embs = torch.randn(2, 3, 6)
+    attention_mask = torch.tensor([[True, True, False], [True, False, False]], dtype=torch.bool)
+    logits = scorer(
+        pair_embs=pair_embs,
+        paths_embs=paths_embs,
+        attention_mask=attention_mask,
+        drug_global_ids=torch.tensor([0, 2], dtype=torch.long),
+        disease_global_ids=torch.tensor([1, 2], dtype=torch.long),
+    )
+    assert logits.shape == (2,)
+    assert torch.isfinite(logits).all()
+
+
+
+def test_pair_aggregation_scorer_drug_text_gate_scales_text_embeddings() -> None:
+    scorer = PairAggregationScorer(
+        pair_emb_dim=4,
+        path_emb_dim=6,
+        hidden_dim=8,
+        dropout=0.0,
+    )
+
+    with torch.no_grad():
+        scorer.drug_text_gate.weight.zero_()
+        scorer.drug_text_gate.bias.fill_(-100.0)
+
+    drug_text_embs = torch.full((2, 768), 3.0)
+    gated_text, gate_weights = scorer._gate_drug_text_embeddings(drug_text_embs=drug_text_embs)
+
+    assert gate_weights.shape == (2, 1)
+    assert torch.all(gate_weights < 1e-6)
+    assert torch.allclose(gated_text, torch.zeros_like(gated_text), atol=1e-5)
 
 
 def test_pair_aggregation_scorer_ablate_gnn_zeros_graph_features() -> None:
@@ -437,6 +470,39 @@ def test_pair_aggregation_scorer_all_padding_logits_remain_finite_after_path_gat
     assert torch.isfinite(logits).all()
     assert torch.isfinite(attention_weights).all()
     assert torch.allclose(attention_weights.sum(dim=1), torch.zeros(2), atol=1e-6)
+
+
+def test_pair_aggregation_scorer_mean_pools_valid_micro_paths() -> None:
+    scorer = PairAggregationScorer(
+        pair_emb_dim=4,
+        path_emb_dim=6,
+        hidden_dim=8,
+        dropout=0.0,
+    )
+
+    raw_path_features = torch.tensor(
+        [
+            [[1.0, 1.0], [2.0, 2.0], [3.0, 3.0]],
+            [[4.0, 4.0], [5.0, 5.0], [6.0, 6.0]],
+            [[7.0, 7.0], [8.0, 8.0], [9.0, 9.0]],
+        ]
+    )
+    path_mask = torch.tensor(
+        [
+            [False, True, True],
+            [True, False, False],
+            [False, False, False],
+        ],
+        dtype=torch.bool,
+    )
+
+    pos_micro_paths, valid_mask = scorer._select_positive_micro_paths(
+        raw_path_features=raw_path_features,
+        path_mask=path_mask,
+    )
+
+    assert torch.equal(valid_mask, torch.tensor([True, True, False]))
+    assert torch.allclose(pos_micro_paths, torch.tensor([[2.5, 2.5], [4.0, 4.0]]))
 
 
 def test_pair_aggregation_scorer_returns_finite_path_margin_loss_in_training() -> None:

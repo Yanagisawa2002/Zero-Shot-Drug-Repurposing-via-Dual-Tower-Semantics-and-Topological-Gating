@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import pickle
+import random
 from pathlib import Path
 from typing import Dict, Mapping, Optional, Tuple
 
@@ -34,9 +35,10 @@ class PairAggregationScorer(nn.Module):
     Asymmetric modality routing:
     - Disease semantics are injected early into the encoder.
     - Drug Morgan fingerprints are injected late at the scorer head.
-    - Drug and disease SapBERT mechanism texts are concatenated symmetrically at the scorer head.
+    - Drug and disease SapBERT texts are projected into the pair space and used as
+      residual anchors for gated graph fusion.
     - Final scoring representation:
-      [h_drug_gnn, h_disease_gnn, h_paths, morgan_raw_feat, drug_text, disease_text]
+      [h_drug_fused, h_disease_fused, h_path_fused, morgan_raw_feat]
 
     Optional semi-supervised distillation:
     - Project every path feature into a 768-d text space
@@ -66,6 +68,8 @@ class PairAggregationScorer(nn.Module):
         drug_text_dim: int = 768,
         disease_text_dim: int = 768,
         ablate_gnn: bool = False,
+        disable_gated_fusion: bool = False,
+        disable_text_semantics: bool = False,
     ) -> None:
         super().__init__()
 
@@ -104,6 +108,8 @@ class PairAggregationScorer(nn.Module):
         self.use_drug_text_late_fusion = drug_text_embeddings_path is not None
         self.use_disease_text_late_fusion = disease_text_embeddings_path is not None
         self.ablate_gnn = bool(ablate_gnn)
+        self.disable_gated_fusion = bool(disable_gated_fusion)
+        self.disable_text_semantics = bool(disable_text_semantics)
 
         self.query_mlp = nn.Sequential(
             nn.Linear(2 * self.pair_emb_dim, self.query_hidden_dim),
@@ -123,9 +129,35 @@ class PairAggregationScorer(nn.Module):
             nn.Linear(self.hidden_dim, 1),
             nn.Sigmoid(),
         )
+        self.drug_text_gate = nn.Linear(self.drug_text_dim, 1)
+        self.drug_text_to_pair = nn.Linear(self.drug_text_dim, self.pair_emb_dim)
+        self.disease_text_to_pair = nn.Linear(self.disease_text_dim, self.pair_emb_dim)
+        self.drug_gate_mlp = nn.Sequential(
+            nn.LayerNorm(2 * self.pair_emb_dim),
+            nn.Linear(2 * self.pair_emb_dim, self.pair_emb_dim),
+            nn.GELU(),
+            nn.Linear(self.pair_emb_dim, 1),
+        )
+        self.disease_gate_mlp = nn.Sequential(
+            nn.LayerNorm(2 * self.pair_emb_dim),
+            nn.Linear(2 * self.pair_emb_dim, self.pair_emb_dim),
+            nn.GELU(),
+            nn.Linear(self.pair_emb_dim, 1),
+        )
+        self.path_residual_gate = nn.Sequential(
+            nn.LayerNorm(2 * self.pair_emb_dim + self.hidden_dim),
+            nn.Linear(2 * self.pair_emb_dim + self.hidden_dim, self.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim, 1),
+        )
+        self.drug_fusion_norm = nn.LayerNorm(self.pair_emb_dim)
+        self.disease_fusion_norm = nn.LayerNorm(self.pair_emb_dim)
+        self.path_fusion_norm = nn.LayerNorm(self.hidden_dim)
         self.path_scorer = nn.Sequential(
+            nn.LayerNorm(2 * self.pair_emb_dim + self.hidden_dim),
             nn.Linear(2 * self.pair_emb_dim + self.hidden_dim, 128),
             nn.GELU(),
+            nn.Dropout(p=0.3),
             nn.Linear(128, 1),
         )
         self.path_loss_margin = 0.5
@@ -133,12 +165,23 @@ class PairAggregationScorer(nn.Module):
         final_input_dim = self.hidden_dim + 2 * self.pair_emb_dim
         if self.use_external_late_fusion:
             final_input_dim += self.drug_fingerprint_dim
-        if self.use_drug_text_late_fusion:
-            final_input_dim += self.drug_text_dim
-        if self.use_disease_text_late_fusion:
-            final_input_dim += self.disease_text_dim
+        self.final_feature_norm = nn.LayerNorm(final_input_dim)
         self.output_mlp = nn.Sequential(
             nn.Linear(final_input_dim, self.output_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.output_hidden_dim, 1),
+        )
+
+        ungated_input_dim = self.hidden_dim + 2 * self.pair_emb_dim
+        if self.use_external_late_fusion:
+            ungated_input_dim += self.drug_fingerprint_dim
+        if self.use_drug_text_late_fusion:
+            ungated_input_dim += self.drug_text_dim
+        if self.use_disease_text_late_fusion:
+            ungated_input_dim += self.disease_text_dim
+        self.ungated_output_mlp = nn.Sequential(
+            nn.Linear(ungated_input_dim, self.output_hidden_dim),
             nn.ReLU(),
             nn.Dropout(self.dropout),
             nn.Linear(self.output_hidden_dim, 1),
@@ -234,13 +277,32 @@ class PairAggregationScorer(nn.Module):
         for module in self.path_gate:
             if hasattr(module, 'reset_parameters'):
                 module.reset_parameters()
+        self.drug_text_gate.reset_parameters()
+        self.drug_text_to_pair.reset_parameters()
+        self.disease_text_to_pair.reset_parameters()
+        for module in self.drug_gate_mlp:
+            if hasattr(module, 'reset_parameters'):
+                module.reset_parameters()
+        for module in self.disease_gate_mlp:
+            if hasattr(module, 'reset_parameters'):
+                module.reset_parameters()
+        for module in self.path_residual_gate:
+            if hasattr(module, 'reset_parameters'):
+                module.reset_parameters()
+        self.drug_fusion_norm.reset_parameters()
+        self.disease_fusion_norm.reset_parameters()
+        self.path_fusion_norm.reset_parameters()
         for module in self.path_scorer:
             if hasattr(module, 'reset_parameters'):
                 module.reset_parameters()
         for module in self.text_projector:
             if hasattr(module, 'reset_parameters'):
                 module.reset_parameters()
+        self.final_feature_norm.reset_parameters()
         for module in self.output_mlp:
+            if hasattr(module, 'reset_parameters'):
+                module.reset_parameters()
+        for module in self.ungated_output_mlp:
             if hasattr(module, 'reset_parameters'):
                 module.reset_parameters()
 
@@ -294,6 +356,8 @@ class PairAggregationScorer(nn.Module):
 
         path_hidden_states = self.path_value_proj(paths_embs)
         predicted_text_embs = self.text_projector(paths_embs)
+        raw_path_features = path_hidden_states
+        path_mask = attention_mask
         aggregated_paths, path_weights = self._aggregate_paths(
             pair_context=pair_context,
             path_hidden_states=path_hidden_states,
@@ -311,15 +375,63 @@ class PairAggregationScorer(nn.Module):
             h_drug_gnn = torch.zeros_like(h_drug_gnn)
             h_disease_gnn = torch.zeros_like(h_disease_gnn)
             aggregated_paths = torch.zeros_like(aggregated_paths)
-        final_feature_blocks = [h_drug_gnn, h_disease_gnn, aggregated_paths]
-        if self.use_external_late_fusion:
-            final_feature_blocks.append(drug_fingerprint_embs)
-        if self.use_drug_text_late_fusion:
-            final_feature_blocks.append(drug_text_embs)
-        if self.use_disease_text_late_fusion:
-            final_feature_blocks.append(disease_text_embs)
-        final_features = torch.cat(final_feature_blocks, dim=-1)
-        logits = self.output_mlp(final_features).squeeze(-1)
+
+        if self.disable_text_semantics:
+            drug_text_embs = torch.zeros_like(drug_text_embs)
+            disease_text_embs = torch.zeros_like(disease_text_embs)
+
+        if self.disable_gated_fusion:
+            final_feature_blocks = [h_drug_gnn, h_disease_gnn, aggregated_paths]
+            if self.use_external_late_fusion:
+                final_feature_blocks.append(drug_fingerprint_embs)
+            if self.use_drug_text_late_fusion:
+                final_feature_blocks.append(drug_text_embs)
+            if self.use_disease_text_late_fusion:
+                final_feature_blocks.append(disease_text_embs)
+            final_features = torch.cat(final_feature_blocks, dim=-1)
+            logits = self.ungated_output_mlp(final_features).squeeze(-1)
+        else:
+            if self.use_drug_text_late_fusion:
+                if self.disable_text_semantics:
+                    drug_text_base = torch.zeros(
+                        (pair_embs.size(0), self.pair_emb_dim),
+                        device=pair_embs.device,
+                        dtype=pair_embs.dtype,
+                    )
+                else:
+                    drug_text_embs, _ = self._gate_drug_text_embeddings(drug_text_embs=drug_text_embs)
+                    drug_text_base = self.drug_text_to_pair(drug_text_embs)
+                drug_gate_input = torch.cat([h_drug_gnn, drug_text_base], dim=-1)
+                drug_gate = torch.sigmoid(self.drug_gate_mlp(drug_gate_input))
+                h_drug_fused = self.drug_fusion_norm(drug_text_base + drug_gate * h_drug_gnn)
+            else:
+                h_drug_fused = self.drug_fusion_norm(h_drug_gnn)
+
+            if self.use_disease_text_late_fusion:
+                if self.disable_text_semantics:
+                    disease_text_base = torch.zeros(
+                        (pair_embs.size(0), self.pair_emb_dim),
+                        device=pair_embs.device,
+                        dtype=pair_embs.dtype,
+                    )
+                else:
+                    disease_text_base = self.disease_text_to_pair(disease_text_embs)
+                disease_gate_input = torch.cat([h_disease_gnn, disease_text_base], dim=-1)
+                disease_gate = torch.sigmoid(self.disease_gate_mlp(disease_gate_input))
+                h_disease_fused = self.disease_fusion_norm(disease_text_base + disease_gate * h_disease_gnn)
+            else:
+                h_disease_fused = self.disease_fusion_norm(h_disease_gnn)
+
+            path_gate_input = torch.cat([aggregated_paths, h_drug_fused, h_disease_fused], dim=-1)
+            path_residual_gate = torch.sigmoid(self.path_residual_gate(path_gate_input))
+            h_path_fused = self.path_fusion_norm(path_residual_gate * aggregated_paths)
+
+            final_feature_blocks = [h_drug_fused, h_disease_fused, h_path_fused]
+            if self.use_external_late_fusion:
+                final_feature_blocks.append(drug_fingerprint_embs)
+            final_features = torch.cat(final_feature_blocks, dim=-1)
+            final_features = self.final_feature_norm(final_features)
+            logits = self.output_mlp(final_features).squeeze(-1)
         distill_loss = self._compute_distillation_loss(
             predicted_text_embs=predicted_text_embs,
             triplet_key_ids=triplet_key_ids,
@@ -328,8 +440,8 @@ class PairAggregationScorer(nn.Module):
         path_loss = self._compute_path_margin_loss(
             h_drug_gnn=h_drug_gnn,
             h_disease_gnn=h_disease_gnn,
-            aggregated_paths=aggregated_paths,
-            has_path_mask=has_path_mask,
+            raw_path_features=raw_path_features,
+            path_mask=path_mask,
         ) if return_path_loss else logits.new_zeros(())
 
         if return_attention and return_distill_loss and return_path_loss:
@@ -389,42 +501,93 @@ class PairAggregationScorer(nn.Module):
         gated_paths = torch.where(has_path_mask, silent_paths * path_gates, zero_paths)
         return gated_paths, has_path_mask, path_gates
 
+    def _gate_drug_text_embeddings(
+        self,
+        drug_text_embs: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        drug_text_weights = torch.sigmoid(self.drug_text_gate(drug_text_embs))
+        assert drug_text_weights.shape == (drug_text_embs.shape[0], 1), (
+            'FATAL: Drug text weight shape mismatch! Expected '
+            f'({drug_text_embs.shape[0]}, 1), got {tuple(drug_text_weights.shape)}'
+        )
+        gated_drug_text_embs = drug_text_embs * drug_text_weights
+        return gated_drug_text_embs, drug_text_weights
+
     def _compute_path_margin_loss(
         self,
         h_drug_gnn: Tensor,
         h_disease_gnn: Tensor,
-        aggregated_paths: Tensor,
-        has_path_mask: Tensor,
+        raw_path_features: Tensor,
+        path_mask: Tensor,
     ) -> Tensor:
         if not self.training:
-            return aggregated_paths.new_zeros(())
+            return raw_path_features.new_zeros(())
 
-        valid_mask = has_path_mask.squeeze(-1)
-        if valid_mask.dim() != 1:
-            valid_mask = valid_mask.view(-1)
-        if int(valid_mask.sum().item()) <= 1:
-            return aggregated_paths.new_zeros(())
+        pos_micro_paths, valid_mask = self._select_positive_micro_paths(
+            raw_path_features=raw_path_features,
+            path_mask=path_mask,
+        )
+        num_valid = pos_micro_paths.size(0)
+        if num_valid <= 1:
+            return raw_path_features.new_zeros(())
 
         pos_drug = h_drug_gnn[valid_mask]
         pos_disease = h_disease_gnn[valid_mask]
-        pos_paths = aggregated_paths[valid_mask]
-        num_valid = pos_paths.size(0)
-        if num_valid <= 1:
-            return aggregated_paths.new_zeros(())
-
-        shuffle_indices = torch.roll(
-            torch.arange(num_valid, device=pos_paths.device),
-            shifts=1,
-            dims=0,
+        shuffle_indices = self._sample_negative_path_indices(
+            num_valid=num_valid,
+            device=pos_micro_paths.device,
         )
-        neg_paths = pos_paths[shuffle_indices]
+        neg_micro_paths = pos_micro_paths[shuffle_indices]
 
-        pos_inputs = torch.cat([pos_drug, pos_disease, pos_paths], dim=-1)
-        neg_inputs = torch.cat([pos_drug, pos_disease, neg_paths], dim=-1)
+        pos_inputs = torch.cat([pos_drug, pos_disease, pos_micro_paths], dim=-1)
+        neg_inputs = torch.cat([pos_drug, pos_disease, neg_micro_paths], dim=-1)
         pos_path_scores = self.path_scorer(pos_inputs).squeeze(-1)
         neg_path_scores = self.path_scorer(neg_inputs).squeeze(-1)
         margin_gap = pos_path_scores - neg_path_scores
+
+        if self.training and random.random() < 0.01:
+            print(
+                f"\n[PROBE] gap mean: {margin_gap.mean().item():.6f}, "
+                f"pos: {pos_path_scores.mean().item():.4f}, "
+                f"neg: {neg_path_scores.mean().item():.4f}"
+            )
+
         return torch.clamp(self.path_loss_margin - margin_gap, min=0.0).mean()
+
+    def _select_positive_micro_paths(
+        self,
+        raw_path_features: Tensor,
+        path_mask: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        valid_mask = path_mask.any(dim=1)
+        if int(valid_mask.sum().item()) == 0:
+            empty_paths = raw_path_features.new_zeros((0, raw_path_features.size(-1)))
+            return empty_paths, valid_mask
+
+        valid_path_features = raw_path_features[valid_mask]
+        valid_path_mask = path_mask[valid_mask]
+
+        mask_expanded = valid_path_mask.unsqueeze(-1).to(valid_path_features.dtype)
+        sum_features = (valid_path_features * mask_expanded).sum(dim=1)
+        valid_counts = mask_expanded.sum(dim=1).clamp(min=1.0)
+        pos_micro_paths = sum_features / valid_counts
+        return pos_micro_paths, valid_mask
+
+    def _sample_negative_path_indices(
+        self,
+        num_valid: int,
+        device: torch.device,
+    ) -> Tensor:
+        if num_valid <= 1:
+            return torch.arange(num_valid, device=device)
+
+        identity = torch.arange(num_valid, device=device)
+        shuffle_indices = identity
+        for _ in range(8):
+            shuffle_indices = torch.randperm(num_valid, device=device)
+            if not torch.any(shuffle_indices == identity):
+                return shuffle_indices
+        return torch.roll(identity, shifts=1, dims=0)
 
 
     def _attention_pool_paths(
@@ -855,5 +1018,3 @@ class PairAggregationScorer(nn.Module):
                     '`disease_global_ids` must align with the batch size of `pair_embs`: '
                     f'{disease_global_ids.size(0)} vs {pair_embs.size(0)}.'
                 )
-
-

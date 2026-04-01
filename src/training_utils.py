@@ -13,6 +13,9 @@ from torch_geometric.data import HeteroData
 from src.repurposing_rgcn import EmbeddingDict, EdgeType, RepurposingRGCN
 
 
+DIRECT_CLINICAL_RELATIONS = frozenset({'indication', 'off-label use', 'contraindication'})
+
+
 def compute_bpr_loss(pos_scores: Tensor, neg_scores: Tensor) -> Tensor:
     """
     ????????? BPR Loss?
@@ -54,6 +57,107 @@ def compute_bce_loss(pos_scores: Tensor, neg_scores: Tensor) -> Tensor:
     return F.binary_cross_entropy_with_logits(logits, labels)
 
 
+def _normalize_direct_relation_name(relation: str) -> str:
+    normalized = str(relation).strip()
+    if normalized.endswith('__reverse__'):
+        normalized = normalized[: -len('__reverse__')]
+    if normalized.endswith('_reverse'):
+        normalized = normalized[: -len('_reverse')]
+    if normalized.startswith('rev_'):
+        normalized = normalized[len('rev_') :]
+    if normalized.startswith('reverse_'):
+        normalized = normalized[len('reverse_') :]
+    return normalized
+
+
+def _is_direct_prediction_edge_type(edge_type: EdgeType) -> bool:
+    src_type, relation, dst_type = edge_type
+    return {src_type, dst_type} == {'drug', 'disease'} and (
+        _normalize_direct_relation_name(relation) in DIRECT_CLINICAL_RELATIONS
+    )
+
+
+def _extract_positive_pairs_from_training_batch(batch: object) -> Tensor:
+    if isinstance(batch, MappingABC):
+        if 'pos_pair_ids' not in batch:
+            raise KeyError("pair-level batch is missing 'pos_pair_ids'.")
+        pair_ids = batch['pos_pair_ids']
+        if not isinstance(pair_ids, Tensor):
+            raise TypeError(f"batch['pos_pair_ids'] must be a Tensor, got {type(pair_ids)}")
+        positive_pairs = pair_ids.detach().to(dtype=torch.long)
+    elif isinstance(batch, (tuple, list)) and len(batch) == 2:
+        pos_paths = batch[0]
+        if not isinstance(pos_paths, Tensor):
+            raise TypeError(f'Legacy path batch must provide Tensor paths, got {type(pos_paths)}')
+        pos_paths = pos_paths.detach().to(dtype=torch.long)
+        if pos_paths.dim() != 2 or pos_paths.size(1) < 2:
+            raise ValueError(
+                'Legacy path batch must have shape (batch_size, path_len) with path_len >= 2, '
+                f'got {tuple(pos_paths.shape)}.'
+            )
+        positive_pairs = torch.stack([pos_paths[:, 0], pos_paths[:, -1]], dim=1)
+    else:
+        raise TypeError(
+            'Unsupported training batch type for dynamic edge masking: '
+            f'{type(batch)}'
+        )
+
+    if positive_pairs.dim() != 2 or positive_pairs.size(1) != 2:
+        raise ValueError(
+            '`positive_pairs` must have shape (batch_size, 2), '
+            f'got {tuple(positive_pairs.shape)}.'
+        )
+    if positive_pairs.numel() == 0:
+        return positive_pairs.reshape(0, 2)
+    return torch.unique(positive_pairs, dim=0)
+
+
+def _mask_direct_target_edges_for_batch(
+    full_graph_data: HeteroData,
+    edge_index_dict: Mapping[EdgeType, Tensor],
+    positive_pairs: Tensor,
+) -> Mapping[EdgeType, Tensor]:
+    if positive_pairs.numel() == 0:
+        return edge_index_dict
+
+    if 'drug' not in full_graph_data.node_types or 'disease' not in full_graph_data.node_types:
+        return edge_index_dict
+    if 'global_id' not in full_graph_data['drug'] or 'global_id' not in full_graph_data['disease']:
+        return edge_index_dict
+
+    device = full_graph_data['drug'].global_id.device
+    positive_pairs = positive_pairs.to(device=device, dtype=torch.long)
+
+    max_drug_id = int(full_graph_data['drug'].global_id.max().item()) if full_graph_data['drug'].global_id.numel() > 0 else 0
+    max_disease_id = int(full_graph_data['disease'].global_id.max().item()) if full_graph_data['disease'].global_id.numel() > 0 else 0
+    max_pair_id = int(positive_pairs.max().item()) if positive_pairs.numel() > 0 else 0
+    hash_base = max(max_drug_id, max_disease_id, max_pair_id) + 1
+    pair_codes = torch.unique(positive_pairs[:, 0] * int(hash_base) + positive_pairs[:, 1])
+
+    masked_edge_index_dict: Dict[EdgeType, Tensor] = {}
+    for edge_type, edge_index in edge_index_dict.items():
+        if not _is_direct_prediction_edge_type(edge_type) or edge_index.numel() == 0:
+            masked_edge_index_dict[edge_type] = edge_index
+            continue
+
+        src_type, _, dst_type = edge_type
+        src_global_ids = full_graph_data[src_type].global_id[edge_index[0].to(dtype=torch.long)]
+        dst_global_ids = full_graph_data[dst_type].global_id[edge_index[1].to(dtype=torch.long)]
+
+        if src_type == 'drug' and dst_type == 'disease':
+            edge_pair_codes = src_global_ids * int(hash_base) + dst_global_ids
+        elif src_type == 'disease' and dst_type == 'drug':
+            edge_pair_codes = dst_global_ids * int(hash_base) + src_global_ids
+        else:
+            masked_edge_index_dict[edge_type] = edge_index
+            continue
+
+        keep_mask = ~torch.isin(edge_pair_codes, pair_codes)
+        masked_edge_index_dict[edge_type] = edge_index if bool(keep_mask.all()) else edge_index[:, keep_mask]
+
+    return masked_edge_index_dict
+
+
 def train_epoch(
     model: RepurposingRGCN,
     full_graph_data: HeteroData,
@@ -93,9 +197,15 @@ def train_epoch(
     for batch in bpr_dataloader:
         optimizer.zero_grad(set_to_none=True)
 
+        current_batch_positive_pairs = _extract_positive_pairs_from_training_batch(batch)
+        masked_edge_index_dict = _mask_direct_target_edges_for_batch(
+            full_graph_data=full_graph_data,
+            edge_index_dict=edge_index_dict,
+            positive_pairs=current_batch_positive_pairs,
+        )
         node_embs_dict = model.encode(
             x_dict=x_dict,
-            edge_index_dict=edge_index_dict,
+            edge_index_dict=masked_edge_index_dict,
         )
         pos_scores, neg_scores, distill_loss, path_loss, batch_size = _score_training_batch(
             model=model,

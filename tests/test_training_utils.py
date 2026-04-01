@@ -4,6 +4,7 @@ import pickle
 import sys
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 from torch.optim import Adam
@@ -17,7 +18,12 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.pair_path_bpr_sampler import build_pair_path_bpr_dataloader
 from src.path_bpr_sampler import build_path_bpr_dataloader
 from src.repurposing_rgcn import RepurposingRGCN
-from src.training_utils import compute_bce_loss, compute_bpr_loss, train_epoch
+from src.training_utils import (
+    _mask_direct_target_edges_for_batch,
+    compute_bce_loss,
+    compute_bpr_loss,
+    train_epoch,
+)
 
 
 def _build_toy_heterodata() -> HeteroData:
@@ -52,6 +58,48 @@ def _build_toy_heterodata() -> HeteroData:
             [10, 21, 31],
             [11, 22, 31],
             [12, 23, 32],
+        ],
+        dtype=torch.long,
+    )
+    data.ho_path_node_types = ('drug', 'gene/protein', 'disease')
+    return data
+
+
+def _build_toy_heterodata_with_direct_prediction_edges() -> HeteroData:
+    data = HeteroData()
+
+    data['drug'].num_nodes = 2
+    data['drug'].global_id = torch.tensor([10, 11], dtype=torch.long)
+
+    data['gene/protein'].num_nodes = 2
+    data['gene/protein'].global_id = torch.tensor([20, 21], dtype=torch.long)
+
+    data['disease'].num_nodes = 2
+    data['disease'].global_id = torch.tensor([30, 31], dtype=torch.long)
+
+    data[('drug', 'targets', 'gene/protein')].edge_index = torch.tensor(
+        [[0, 1], [0, 1]], dtype=torch.long
+    )
+    data[('gene/protein', 'targeted_by', 'drug')].edge_index = torch.tensor(
+        [[0, 1], [0, 1]], dtype=torch.long
+    )
+    data[('disease', 'disease_protein', 'gene/protein')].edge_index = torch.tensor(
+        [[0, 1], [0, 1]], dtype=torch.long
+    )
+    data[('gene/protein', 'disease_protein__reverse__', 'disease')].edge_index = torch.tensor(
+        [[0, 1], [0, 1]], dtype=torch.long
+    )
+    data[('drug', 'indication', 'disease')].edge_index = torch.tensor(
+        [[0, 1], [0, 1]], dtype=torch.long
+    )
+    data[('disease', 'rev_indication', 'drug')].edge_index = torch.tensor(
+        [[0, 1], [0, 1]], dtype=torch.long
+    )
+
+    data.ho_pos_paths = torch.tensor(
+        [
+            [10, 20, 30],
+            [11, 21, 31],
         ],
         dtype=torch.long,
     )
@@ -321,3 +369,65 @@ def test_train_epoch_reports_positive_path_loss_when_enabled() -> None:
     assert metrics['loss'] > 0.0
     assert metrics['path_loss'] >= 0.0
     assert torch.isfinite(torch.tensor(metrics['path_loss']))
+
+
+def test_mask_direct_target_edges_for_batch_removes_only_current_positive_pairs() -> None:
+    data = _build_toy_heterodata_with_direct_prediction_edges()
+    positive_pairs = torch.tensor([[10, 30]], dtype=torch.long)
+
+    masked_edge_index_dict = _mask_direct_target_edges_for_batch(
+        full_graph_data=data,
+        edge_index_dict=data.edge_index_dict,
+        positive_pairs=positive_pairs,
+    )
+
+    forward_edges = masked_edge_index_dict[('drug', 'indication', 'disease')]
+    reverse_edges = masked_edge_index_dict[('disease', 'rev_indication', 'drug')]
+
+    assert forward_edges.shape[1] == 1
+    assert reverse_edges.shape[1] == 1
+    assert torch.equal(forward_edges, torch.tensor([[1], [1]], dtype=torch.long))
+    assert torch.equal(reverse_edges, torch.tensor([[1], [1]], dtype=torch.long))
+    assert torch.equal(
+        masked_edge_index_dict[('drug', 'targets', 'gene/protein')],
+        data[('drug', 'targets', 'gene/protein')].edge_index,
+    )
+
+
+def test_train_epoch_passes_batch_masked_direct_edges_into_encode() -> None:
+    torch.manual_seed(5)
+
+    data = _build_toy_heterodata_with_direct_prediction_edges()
+    dataloader = build_pair_path_bpr_dataloader(
+        data=data,
+        batch_size=1,
+        shuffle=False,
+        num_workers=0,
+        negative_strategy='mixed',
+    )
+    model = RepurposingRGCN(
+        data=data,
+        hidden_dim=8,
+        out_dim=8,
+        scorer_hidden_dim=4,
+        dropout=0.0,
+        dropedge_p=0.0,
+    )
+    optimizer = Adam(model.parameters(), lr=1e-2)
+
+    with patch.object(model, 'encode', wraps=model.encode) as encode_mock:
+        train_epoch(
+            model=model,
+            full_graph_data=data,
+            bpr_dataloader=dataloader,
+            optimizer=optimizer,
+        )
+
+    first_edge_index_dict = encode_mock.call_args_list[0].kwargs['edge_index_dict']
+    forward_edges = first_edge_index_dict[('drug', 'indication', 'disease')]
+    reverse_edges = first_edge_index_dict[('disease', 'rev_indication', 'drug')]
+
+    assert forward_edges.shape[1] == 1
+    assert reverse_edges.shape[1] == 1
+    assert torch.equal(forward_edges, torch.tensor([[1], [1]], dtype=torch.long))
+    assert torch.equal(reverse_edges, torch.tensor([[1], [1]], dtype=torch.long))
